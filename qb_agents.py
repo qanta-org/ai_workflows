@@ -90,39 +90,133 @@ class QuizBowlTossupAgent:
             if out_var not in workflow.outputs:
                 raise ValueError(f"Output variable {out_var} not found in workflow outputs")
 
-    def _single_run(self, question_run: str, run_idx: int) -> TossupResult:
-        """Process a single question run.
+    def _single_run(self, question_run: str | dict, run_idx: int) -> TossupResult:
+        """
+        Process a single question run (supports both text-only and multimodal).
+        
         Args:
-            question_run: The question run to process
+            question_run: Either a string (text-only) or dict with text/images (multimodal)
             run_idx: The position of the question run (1-indexed)
 
         Returns:
             A TossupResult containing the answer, confidence, logprob, buzz, question fragment, position, step contents, response time, and step outputs
         """
+        # Normalize input: convert string to dict format for consistency
+        if isinstance(question_run, str):
+            question_input = {"text": question_run, "images": [], "is_multimodal": False}
+        else:
+            question_input = question_run
+        
+        # Build workflow input with text (required)
+        workflow_input = {self.external_input_variable: question_input["text"]}
+        
+        # Add multimodal data if present
+        is_multimodal = question_input.get("is_multimodal", False)
+        images = question_input.get("images", [])
+        
+        # Log multimodal status for debugging
+        logger.info(f"[Multimodal Debug] Run {run_idx}: is_multimodal={is_multimodal}, images={images}, has_multimodal_tokens={'multimodal_tokens' in question_input}")
+        
+        # Resolve image paths if they're relative
+        if is_multimodal:
+            # Try to extract images from multimodal_tokens if images list is empty
+            if not images and "multimodal_tokens" in question_input and question_input["multimodal_tokens"]:
+                try:
+                    from src.multimodal_utils import resolve_image_path_from_token
+                except ImportError:
+                    from multimodal_utils import resolve_image_path_from_token  # type: ignore
+                base_dir = question_input.get("_base_dir", "")
+                question_id = question_input.get("qid", "")
+                image_paths = []
+                for token in question_input["multimodal_tokens"]:
+                    if isinstance(token, dict) and token.get("type") == "image":
+                        resolved = resolve_image_path_from_token(token, base_dir, question_id)
+                        if resolved:
+                            image_paths.append(resolved)
+                        elif token.get("path"):
+                            image_paths.append(token["path"])
+                if image_paths:
+                    images = image_paths
+                    logger.info(f"[Multimodal Debug] Extracted {len(image_paths)} images from multimodal_tokens: {image_paths}")
+            
+            # Pass through images (paths, URLs, or embedded PIL from Hub dataset)
+            if images:
+                import os
+                from pathlib import Path
+                resolved_images = []
+                for img in images:
+                    # Embedded image (e.g. PIL from Hub dataset) — pass through as-is
+                    if not isinstance(img, str):
+                        resolved_images.append(img)
+                        continue
+                    img_path = img
+                    # If already absolute URL or path, use as-is
+                    if os.path.isabs(img_path) or img_path.startswith(("http://", "https://")):
+                        resolved_images.append(img_path)
+                    else:
+                        # Try to resolve relative path
+                        possible_paths = [
+                            img_path,
+                            f"../model-simulation/multimodal_test/{img_path}",
+                            f"model-simulation/multimodal_test/{img_path}",
+                            os.path.join(os.getcwd(), "model-simulation", "multimodal_test", img_path),
+                        ]
+                        found = False
+                        for path in possible_paths:
+                            abs_path = os.path.abspath(path)
+                            if os.path.exists(abs_path):
+                                resolved_images.append(abs_path)
+                                logger.info(f"[Multimodal Debug] Resolved image path: {img_path} -> {abs_path}")
+                                found = True
+                                break
+                        if not found:
+                            resolved_images.append(img_path)
+                            logger.warning(f"[Multimodal Debug] Could not resolve image path: {img_path}, using as-is")
+                
+                if resolved_images:
+                    workflow_input["images"] = resolved_images
+                    logger.info(f"[Multimodal Debug] Added {len(resolved_images)} images to workflow_input: {resolved_images}")
+                    # Also include multimodal_tokens if available for context
+                    if "multimodal_tokens" in question_input:
+                        workflow_input["multimodal_tokens"] = question_input["multimodal_tokens"]
+                        logger.info(f"[Multimodal Debug] Added multimodal_tokens with {len(question_input['multimodal_tokens'])} tokens")
+                else:
+                    logger.warning(f"[Multimodal Debug] No valid image paths after resolution")
+            elif is_multimodal:
+                logger.warning(f"[Multimodal Debug] is_multimodal=True but no images found")
+        else:
+            logger.info(f"[Multimodal Debug] Not multimodal or no images - text-only question")
+        
         answer_var_step = self.workflow.outputs["answer"].split(".")[0]
         workflow_output, response_time = _get_workflow_response(
-            self.workflow, {self.external_input_variable: question_run}, logprob_step=answer_var_step
+            self.workflow, workflow_input, logprob_step=answer_var_step
         )
         final_outputs = workflow_output["final_outputs"]
         buzz = self.workflow.buzzer.run(final_outputs["confidence"], logprob=workflow_output["logprob"])
+        
+        # Use text for question_fragment display
+        question_fragment = question_input["text"]
+        
         result: TossupResult = {
             "run_idx": run_idx,
             "guess": final_outputs["answer"],
             "confidence": final_outputs["confidence"],
             "logprob": workflow_output["logprob"],
             "buzz": buzz,
-            "question_fragment": question_run,
+            "question_fragment": question_fragment,
             "step_contents": workflow_output["step_contents"],
             "step_outputs": workflow_output["intermediate_outputs"],  # Include intermediate step outputs
             "response_time": response_time,
         }
         return result
 
-    def run(self, question_runs: list[str], early_stop: bool = True) -> Iterable[TossupResult]:
-        """Process a tossup question and decide when to buzz based on confidence.
+    def run(self, question_runs: list[str] | list[dict], early_stop: bool = True) -> Iterable[TossupResult]:
+        """
+        Process a tossup question and decide when to buzz based on confidence.
+        Supports both text-only (list[str]) and multimodal (list[dict]) question runs.
 
         Args:
-            question_runs: Progressive reveals of the question text
+            question_runs: Progressive reveals of the question (text strings or multimodal dicts)
             early_stop: Whether to stop after the first buzz
 
         Yields:
@@ -136,9 +230,9 @@ class QuizBowlTossupAgent:
                 - response_time: Time taken for response
                 - step_outputs: Outputs from each step
         """
-        for i, question_text in enumerate(question_runs):
+        for i, question_run in enumerate(question_runs):
             # Execute the complete workflow
-            result = self._single_run(question_text, i + 1)
+            result = self._single_run(question_run, i + 1)
 
             yield result
 
@@ -174,12 +268,13 @@ class QuizBowlBonusAgent:
             if out_var not in workflow.outputs:
                 raise ValueError(f"Output variable {out_var} not found in workflow outputs")
 
-    def run(self, leadin: str, part: str) -> BonusResult:
-        """Process a bonus part with the given leadin.
+    def run(self, leadin: str | dict, part: str | dict) -> BonusResult:
+        """Process a bonus part with the given leadin and part.
+        Supports both text-only and multimodal (image) bonuses.
 
         Args:
-            leadin: The leadin text for the bonus question
-            part: The specific part text to answer
+            leadin: The leadin text or dict with text, images, is_multimodal (multimodal bonus)
+            part: The part text or dict with text, images, is_multimodal (multimodal bonus)
 
         Returns:
             Dict containing:
@@ -190,12 +285,79 @@ class QuizBowlBonusAgent:
                 - response_time: Time taken for response
                 - step_outputs: Outputs from each step
         """
+        # Normalize to text and collect images (leadin first, then part)
+        leadin_text = leadin if isinstance(leadin, str) else leadin.get("text", "")
+        part_text = part if isinstance(part, str) else part.get("text", "")
+
+        workflow_input = {"leadin": leadin_text, "part": part_text}
+
+        # Multimodal: combine leadin images + part images (order matches prompt)
+        leadin_images = [] if isinstance(leadin, str) else leadin.get("images") or []
+        part_images = [] if isinstance(part, str) else part.get("images") or []
+
+        if isinstance(leadin, dict) and not leadin_images and leadin.get("multimodal_tokens"):
+            try:
+                from src.multimodal_utils import resolve_image_path_from_token
+            except ImportError:
+                from multimodal_utils import resolve_image_path_from_token  # type: ignore
+            base_dir = leadin.get("_base_dir", "")
+            qid = leadin.get("qid", "")
+            for token in leadin["multimodal_tokens"]:
+                if isinstance(token, dict) and token.get("type") == "image":
+                    resolved = resolve_image_path_from_token(token, base_dir, qid)
+                    if resolved:
+                        leadin_images.append(resolved)
+                    elif token.get("path"):
+                        leadin_images.append(token["path"])
+
+        if isinstance(part, dict) and not part_images and part.get("multimodal_tokens"):
+            try:
+                from src.multimodal_utils import resolve_image_path_from_token
+            except ImportError:
+                from multimodal_utils import resolve_image_path_from_token  # type: ignore
+            base_dir = part.get("_base_dir", "")
+            qid = part.get("qid", "")
+            for token in part["multimodal_tokens"]:
+                if isinstance(token, dict) and token.get("type") == "image":
+                    resolved = resolve_image_path_from_token(token, base_dir, qid)
+                    if resolved:
+                        part_images.append(resolved)
+                    elif token.get("path"):
+                        part_images.append(token["path"])
+
+        combined_images = list(leadin_images) + list(part_images)
+        if combined_images:
+            # Resolve paths for relative/local images (same as tossup agent)
+            import os
+            resolved_images = []
+            for img in combined_images:
+                if not isinstance(img, str):
+                    resolved_images.append(img)
+                    continue
+                img_path = img
+                if os.path.isabs(img_path) or img_path.startswith(("http://", "https://")):
+                    resolved_images.append(img_path)
+                else:
+                    possible_paths = [
+                        img_path,
+                        f"../model-simulation/multimodal_test/{img_path}",
+                        f"model-simulation/multimodal_test/{img_path}",
+                        os.path.join(os.getcwd(), "model-simulation", "multimodal_test", img_path),
+                    ]
+                    found = False
+                    for path in possible_paths:
+                        abs_path = os.path.abspath(path)
+                        if os.path.exists(abs_path):
+                            resolved_images.append(abs_path)
+                            found = True
+                            break
+                    if not found:
+                        resolved_images.append(img_path)
+            workflow_input["images"] = resolved_images
+
         workflow_output, response_time = _get_workflow_response(
             self.workflow,
-            {
-                "leadin": leadin,
-                "part": part,
-            },
+            workflow_input,
         )
         final_outputs = workflow_output["final_outputs"]
         return {
@@ -205,7 +367,7 @@ class QuizBowlBonusAgent:
             "explanation": final_outputs["explanation"],
             "step_contents": workflow_output["step_contents"],
             "response_time": response_time,
-            "step_outputs": workflow_output["intermediate_outputs"],  # Include intermediate step outputs
+            "step_outputs": workflow_output["intermediate_outputs"],
         }
 
 

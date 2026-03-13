@@ -1,8 +1,13 @@
 # %%
 
+import base64
+import io
 import json
 import os
-from typing import Any, Optional
+import tempfile
+import urllib.request
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 import cohere
 import json_repair
@@ -39,6 +44,56 @@ from .llmcache import LLMCache
 set_llm_cache(SQLiteCache(database_path=f"{CACHE_PATH}/langchain.db"))
 
 llm_cache = LLMCache(cache_dir=CACHE_PATH, hf_repo=LLM_CACHE_REPO)
+
+MIME_BY_EXT = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _image_to_base64_data(image_spec: Any) -> Tuple[Optional[str], str]:
+    """
+    Convert image (path str, URL str, or PIL/Image object) to (base64_str, mime_type).
+    Returns (None, mime_type) on failure. Used for Hub dataset embedded images (PIL) and local paths/URLs.
+    """
+    mime_type = "image/jpeg"
+    # PIL / HF Image object (e.g. from Hub dataset row["images"][i])
+    if not isinstance(image_spec, str):
+        try:
+            buf = io.BytesIO()
+            image_spec.save(buf, format="JPEG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+        except Exception as e:
+            logger.warning(f"Failed to encode image object: {e}, skipping")
+            return None, mime_type
+    # URL
+    if image_spec.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(
+                image_spec,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; quizbowl/1.0)"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as response:
+                image_data = base64.b64encode(response.read()).decode("utf-8")
+            ext = Path(image_spec).suffix.lower()
+            mime_type = MIME_BY_EXT.get(ext, "image/jpeg")
+            return image_data, mime_type
+        except Exception as e:
+            logger.warning(f"Failed to download image from URL {image_spec}: {e}, skipping")
+            return None, mime_type
+    # Local file path
+    path = Path(image_spec)
+    if not path.exists():
+        logger.warning(f"Image file not found: {image_spec}, skipping")
+        return None, mime_type
+    with open(path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+    ext = path.suffix.lower()
+    mime_type = MIME_BY_EXT.get(ext, "image/jpeg")
+    return image_data, mime_type
 
 
 class CohereSchemaGenerator(GenerateJsonSchema):
@@ -113,18 +168,63 @@ def _cohere_completion(
 
 
 def _langchain_completion(
-    provider: str, model: str, system: str, prompt: str, response_model, temperature: float | None = None
+    provider: str, 
+    model: str, 
+    system: str, 
+    prompt: str, 
+    response_model, 
+    temperature: float | None = None,
+    images: list[str] | None = None
 ) -> str:
+    from langchain_core.messages import HumanMessage, SystemMessage
+    import base64
+    from pathlib import Path
+    
     if provider == "OpenAI":
-        model_cls = ChatOpenAI
+        # Use US endpoint by default to avoid 401 incorrect regional hostname
+        openai_base = os.getenv("OPENAI_BASE_URL", "https://us.api.openai.com/v1")
+        llm = ChatOpenAI(
+            model=model,
+            temperature=temperature,
+            openai_api_base=openai_base or "https://us.api.openai.com/v1",
+        ).with_structured_output(response_model, include_raw=True)
     elif provider == "Anthropic":
         model_cls = ChatAnthropic
+        llm = model_cls(model=model, temperature=temperature).with_structured_output(response_model, include_raw=True)
     elif provider == "DeepSeek":
         model_cls = ChatDeepSeek
+        llm = model_cls(model=model, temperature=temperature).with_structured_output(response_model, include_raw=True)
     else:
         raise ValueError(f"Provider {provider} not supported")
-    llm = model_cls(model=model, temperature=temperature).with_structured_output(response_model, include_raw=True)
-    output = llm.invoke([("system", system), ("human", prompt)])
+    
+    # Build messages with images if provided
+    messages = [SystemMessage(content=system)]
+    
+    if images:
+        human_content = []
+        images_added = 0
+        for img in images:
+            image_data, mime_type = _image_to_base64_data(img)
+            if image_data:
+                human_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{image_data}"
+                    }
+                })
+                images_added += 1
+        if images_added == 0:
+            logger.warning(f"[Multimodal Debug] None of the {len(images)} provided images could be loaded.")
+        elif images_added > 0:
+            logger.info(f"[Multimodal Debug] Successfully added {images_added}/{len(images)} images to API call")
+        if prompt:
+            human_content.append({"type": "text", "text": prompt})
+        
+        messages.append(HumanMessage(content=human_content))
+    else:
+        messages.append(HumanMessage(content=prompt))
+    
+    output = llm.invoke(messages)
     try:
         return _get_langchain_chat_output(output, prompt)
     except OutputParserException as e:
@@ -141,13 +241,58 @@ def _langchain_completion(
 
 
 def _openai_completion(
-    model: str, system: str, prompt: str, response_model, temperature: float | None = None, logprobs: bool = True
+    model: str, 
+    system: str, 
+    prompt: str, 
+    response_model, 
+    temperature: float | None = None, 
+    logprobs: bool = True,
+    images: list[str] | None = None
 ) -> str:
+    import base64
+    import tempfile
+    from pathlib import Path
+    import urllib.request
+    
+    # Build user message content
+    user_content = []
+    
+    # Add images if provided (paths, URLs, or PIL/Image objects e.g. from Hub dataset)
+    if images:
+        logger.info(f"[Multimodal Debug] Processing {len(images)} images for API call")
+        images_added = 0
+        for img in images:
+            image_data, mime_type = _image_to_base64_data(img)
+            if image_data:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{image_data}"
+                    }
+                })
+                images_added += 1
+        if images_added == 0:
+            logger.warning(f"[Multimodal Debug] None of the {len(images)} provided images could be loaded.")
+        elif images_added > 0:
+            logger.info(f"[Multimodal Debug] Successfully added {images_added}/{len(images)} images to API call")
+    
+    # Add text prompt
+    if prompt:
+        user_content.append({
+            "type": "text",
+            "text": prompt
+        })
+    
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": user_content if images else prompt},
     ]
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    # Use US endpoint by default to avoid 401 incorrect regional hostname; override with OPENAI_BASE_URL if set
+    base_url = os.getenv("OPENAI_BASE_URL", "https://us.api.openai.com/v1")
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=base_url or "https://us.api.openai.com/v1",
+    )
     response = client.beta.chat.completions.parse(
         model=model,
         messages=messages,
@@ -165,7 +310,13 @@ def _openai_completion(
 
 
 def _llm_completion(
-    model: str, system: str, prompt: str, response_format, temperature: float | None = None, logprobs: bool = False
+    model: str, 
+    system: str, 
+    prompt: str, 
+    response_format, 
+    temperature: float | None = None, 
+    logprobs: bool = False,
+    images: list[str] | None = None
 ) -> dict[str, Any]:
     """
     Generate a completion from an LLM provider with structured output without caching.
@@ -177,6 +328,7 @@ def _llm_completion(
         response_format: Pydantic model defining the expected response structure
         logprobs (bool, optional): Whether to return log probabilities. Defaults to False.
             Note: Not supported by Anthropic models.
+        images (list[str] | None, optional): List of image paths or URLs to include. Defaults to None.
 
     Returns:
         dict: Contains:
@@ -190,24 +342,32 @@ def _llm_completion(
     model_name = AVAILABLE_MODELS[model]["model"]
     provider = model.split("/")[0]
     if provider == "Cohere":
+        if images:
+            logger.warning(f"Cohere provider does not support images, ignoring {len(images)} images")
         return _cohere_completion(model_name, system, prompt, response_format, temperature, logprobs)
     elif provider == "OpenAI":
         if _openai_is_json_mode_supported(model_name):
-            return _openai_completion(model_name, system, prompt, response_format, temperature, logprobs)
+            return _openai_completion(model_name, system, prompt, response_format, temperature, logprobs, images)
         elif logprobs:
             raise ValueError(f"{model} does not support logprobs feature.")
         else:
-            return _langchain_completion("OpenAI", model_name, system, prompt, response_format, temperature)
+            return _langchain_completion("OpenAI", model_name, system, prompt, response_format, temperature, images)
     elif provider in {"Anthropic", "DeepSeek"}:
         if logprobs:
             raise ValueError(f"{provider} models do not support logprobs")
-        return _langchain_completion(provider, model_name, system, prompt, response_format, temperature)
+        return _langchain_completion(provider, model_name, system, prompt, response_format, temperature, images)
     else:
         raise ValueError(f"Provider {provider} not supported")
 
 
 def completion(
-    model: str, system: str, prompt: str, response_format, temperature: float | None = None, logprobs: bool = True
+    model: str, 
+    system: str, 
+    prompt: str, 
+    response_format, 
+    temperature: float | None = None, 
+    logprobs: bool = True,
+    images: list[str] | None = None
 ) -> dict[str, Any]:
     """
     Generate a completion from an LLM provider with structured output with caching.
@@ -217,8 +377,10 @@ def completion(
         system (str): System prompt/instructions for the model
         prompt (str): User prompt/input
         response_format: Pydantic model defining the expected response structure
+        temperature (float | None, optional): Temperature for sampling. Defaults to None.
         logprobs (bool, optional): Whether to return log probabilities. Defaults to True.
             Note: Not supported by Anthropic models.
+        images (list[str] | None, optional): List of image paths or URLs to include. Defaults to None.
 
     Returns:
         dict: Contains:
@@ -235,26 +397,27 @@ def completion(
         # logger.warning(f"{model} does not support logprobs feature, setting logprobs to False")
         logprobs = False
 
-    # Check cache first
+    # Check cache first (note: cache key doesn't include images yet - may need enhancement)
     cached_response = llm_cache.get(model, system, prompt, response_format, temperature)
-    if cached_response and (not logprobs or cached_response.get("logprob")):
+    if cached_response and (not logprobs or cached_response.get("logprob")) and not images:
         logger.trace(f"Cache hit for model {model}")
         return cached_response
 
-    logger.trace(f"Cache miss for model {model}, calling API. Logprobs: {logprobs}")
+    logger.trace(f"Cache miss for model {model}, calling API. Logprobs: {logprobs}, Images: {len(images) if images else 0}")
 
     # Continue with the original implementation for cache miss
-    response = _llm_completion(model, system, prompt, response_format, temperature, logprobs)
+    response = _llm_completion(model, system, prompt, response_format, temperature, logprobs, images)
 
-    # Update cache with the new response
-    llm_cache.set(
-        model,
-        system,
-        prompt,
-        response_format,
-        temperature,
-        response,
-    )
+    # Update cache with the new response (only if no images to avoid cache issues)
+    if not images:
+        llm_cache.set(
+            model,
+            system,
+            prompt,
+            response_format,
+            temperature,
+            response,
+        )
 
     return response
 

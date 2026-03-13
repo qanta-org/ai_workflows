@@ -24,6 +24,7 @@ dependencies and manages the flow of data between steps. It supports:
 from typing import Any, TypedDict
 
 import pydantic
+from loguru import logger
 
 from .configs import FUNCTION_MAP, TYPE_MAP
 from .errors import WorkflowError
@@ -204,8 +205,52 @@ def execute_model_step(
     # Ensure inputs are processed using the specified functions in input_fields.
     processed_inputs = create_processed_inputs(model_step, available_vars)
 
+    # Extract images if present (check available_vars first, then processed_inputs)
+    images = None
+    
+    # Check available_vars directly (images may not be in input_fields)
+    if "images" in available_vars:
+        images = available_vars["images"]
+        if not isinstance(images, list):
+            images = [images] if images else None
+        elif len(images) == 0:
+            images = None
+        if images:
+            logger.info(f"[Multimodal Debug] Step {model_step.id}: Found {len(images)} images in available_vars: {images}")
+    
+    # Also check processed_inputs (in case images is an input field)
+    if images is None and "images" in processed_inputs:
+        images = processed_inputs.pop("images")
+        if not isinstance(images, list):
+            images = [images] if images else None
+        elif len(images) == 0:
+            images = None
+        if images:
+            logger.info(f"[Multimodal Debug] Step {model_step.id}: Found {len(images)} images in processed_inputs: {images}")
+    
+    # Check for images in multimodal_tokens if present
+    if images is None:
+        multimodal_tokens = available_vars.get("multimodal_tokens") or processed_inputs.get("multimodal_tokens")
+        if isinstance(multimodal_tokens, list):
+            image_paths = [
+                token.get("path") 
+                for token in multimodal_tokens 
+                if isinstance(token, dict) and token.get("type") == "image" and token.get("path")
+            ]
+            if image_paths:
+                images = image_paths
+                logger.info(f"[Multimodal Debug] Step {model_step.id}: Extracted {len(image_paths)} images from multimodal_tokens: {image_paths}")
+    
+    if images is None:
+        logger.info(f"[Multimodal Debug] Step {model_step.id}: No images found - text-only input")
+
     # Construct the input prompt for the model
     input_str = "\n".join(f"{k}: {v}" for k, v in processed_inputs.items())
+    
+    # Add note about images if present
+    if images:
+        input_str += f"\n\nNote: {len(images)} image(s) are included with this question. Please analyze the image(s) along with the text to answer the question."
+    
     step_result = f"Inputs: \n{input_str}"
 
     # Define the expected output fields and their types
@@ -215,6 +260,12 @@ def execute_model_step(
     }
     ModelResponse = pydantic.create_model("ModelResponse", **fields)
 
+    # Log image status before API call
+    if images:
+        logger.info(f"[Multimodal Debug] Step {model_step.id}: Calling {model_step.provider}/{model_step.model} with {len(images)} images: {images}")
+    else:
+        logger.info(f"[Multimodal Debug] Step {model_step.id}: Calling {model_step.provider}/{model_step.model} with no images (text-only)")
+    
     # Execute the model step using litellm
     api_response = completion(
         model=f"{model_step.provider}/{model_step.model}",
@@ -223,6 +274,7 @@ def execute_model_step(
         response_format=ModelResponse,
         temperature=model_step.temperature,
         logprobs=logprobs,
+        images=images,
     )
 
     # Map the parsed response to the output fields
@@ -299,6 +351,12 @@ def execute_multi_step_workflow(
         if var not in input_values:
             raise WorkflowError(f"Missing required workflow input: {var}")
         computed_values[var] = input_values[var]
+    
+    # Also include any additional input values (like images for multimodal support)
+    # that aren't explicitly declared but may be used by steps
+    for var, value in input_values.items():
+        if var not in computed_values:
+            computed_values[var] = value
 
     # Step 2: Build dependency graph among model steps.
     # For each step, examine its input_fields. If an input is not in the pre-populated external inputs,
@@ -394,7 +452,7 @@ def execute_simple_workflow(
         if var not in input_values:
             raise WorkflowError(f"Missing required workflow input: {var}")
 
-    # Execute the step
+    # Execute the step (input_values already contains all inputs including optional ones like images)
     step_result = execute_model_step(step, input_values, return_full_content=return_full_content, logprobs=logprobs)
     step_outputs = step_result["outputs"]
     step_contents = {step.id: step_result["content"]} if return_full_content else {}

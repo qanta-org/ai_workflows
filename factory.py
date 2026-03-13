@@ -35,7 +35,7 @@ def create_first_step_input_fields() -> list[InputField]:
     return [
         InputField(
             name="question",
-            description="The question text progressively revealed to the agent so far.",
+            description="The question text progressively revealed so far. For multimodal questions, images are attached automatically by the app (no separate input).",
             variable="question_text",
         )
     ]
@@ -104,7 +104,17 @@ def create_simple_qb_tossup_workflow():
                 provider="OpenAI",
                 call_type="llm",
                 temperature=0.3,
-                system_prompt="You are a helpful assistant that can answer questions.",
+                system_prompt="""You are a professional quizbowl player answering tossup questions.
+Given a progressively revealed question (which may include both text and images), provide your best guess at the answer and your confidence level.
+
+Your task:
+1. Analyze the clues provided in the question text AND any images that are included
+2. If images are present, carefully examine them as they contain important visual information needed to answer the question
+3. Determine the most likely answer based on all available information (text and images)
+4. Assess your confidence in your answer on a scale from 0.0 (complete guess) to 1.0 (absolute certainty)
+
+Keep your answer direct and concise, limited to a couple of words.
+Your confidence should reflect how certain you are based on the clues revealed so far (including visual clues from images if present).""",
                 input_fields=[InputField(name="question", description="The question text", variable="question_text")],
                 output_fields=[
                     OutputField(

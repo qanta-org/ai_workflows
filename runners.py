@@ -1,3 +1,4 @@
+import json
 from concurrent import futures
 
 from datasets import Dataset
@@ -7,12 +8,118 @@ from tqdm import tqdm
 from .metrics import evaluate_prediction, helpfulness_score
 from .qb_agents import QuizBowlBonusAgent, QuizBowlTossupAgent
 
+try:
+    from src.multimodal_utils import get_text_with_placeholders, resolve_image_path_from_token
+except ImportError:
+    from multimodal_utils import get_text_with_placeholders, resolve_image_path_from_token  # type: ignore
 
-def get_question_runs(example: dict) -> list[str]:
+
+def _parse_multimodal_tokens(example: dict):
+    """Parse multimodal_tokens from example, return None if text-only."""
+    if "multimodal_tokens" not in example or not example["multimodal_tokens"]:
+        return None
+    
+    tokens = example["multimodal_tokens"]
+    
+    # Handle string format (from CSV/JSONL)
+    if isinstance(tokens, str):
+        try:
+            tokens = json.loads(tokens)
+        except json.JSONDecodeError:
+            return None
+    
+    # Validate token structure
+    if not isinstance(tokens, list):
+        return None
+    
+    for token in tokens:
+        if not isinstance(token, dict):
+            return None
+        if "type" not in token or "position" not in token:
+            return None
+        if token["type"] == "text" and "content" not in token:
+            return None
+        if token["type"] == "image":
+            if not token.get("path") and not token.get("hash_key") and not token.get("hashKey"):
+                return None
+        # delay: requires position only; duration is optional
+        if token["type"] == "delay":
+            continue
+    
+    return tokens
+
+
+def get_question_runs(example: dict) -> list[dict]:
+    """
+    Get progressive question runs, supporting both text-only and multimodal.
+    
+    Returns:
+        List of question run dicts, each containing:
+        - text: str (text content up to this position)
+        - images: list[str] (image paths/URLs up to this position)
+        - multimodal_tokens: list[dict] (full token sequence up to this position) or None
+        - is_multimodal: bool
+    """
+    multimodal_tokens = _parse_multimodal_tokens(example)
+    
+    if not multimodal_tokens:
+        # Text-only: backward compatibility
+        tokens = example["question"].split()
+        question_runs = []
+        for run_idx in example["run_indices"]:
+            question_runs.append({
+                "text": " ".join(tokens[: run_idx + 1]),
+                "images": [],
+                "multimodal_tokens": None,
+                "is_multimodal": False
+            })
+        return question_runs
+    
+    # Multimodal: process tokens
+    sorted_tokens = sorted(multimodal_tokens, key=lambda x: x["position"])
     question_runs = []
-    tokens = example["question"].split()
+    
+    # Log for debugging
+    from loguru import logger
+    logger.info(f"[Multimodal Debug] Creating question runs: {len(sorted_tokens)} tokens, run_indices={example.get('run_indices', [])}")
+    
+    base_dir = example.get("_base_dir", "")
+    question_id = example.get("qid", "")
+    embedded_images = example.get("images")  # From Hub: list of PIL/Image in token order
     for run_idx in example["run_indices"]:
-        question_runs.append(" ".join(tokens[: run_idx + 1]))
+        tokens_up_to_idx = sorted_tokens[: run_idx + 1]
+        # Text with placeholders: <img:hash_key> and <delay>
+        text = get_text_with_placeholders(tokens_up_to_idx)
+        images = []
+        if embedded_images and not base_dir:
+            # Use embedded images (Hub dataset): i-th image token -> embedded_images[i]
+            image_index = 0
+            for token in tokens_up_to_idx:
+                if token.get("type") == "image":
+                    if image_index < len(embedded_images):
+                        images.append(embedded_images[image_index])
+                    image_index += 1
+        else:
+            for token in tokens_up_to_idx:
+                if token["type"] == "image":
+                    resolved = resolve_image_path_from_token(token, base_dir, question_id)
+                    if resolved:
+                        images.append(resolved)
+                    elif token.get("path"):
+                        images.append(token["path"])
+        
+        question_run = {
+            "text": text,
+            "images": images,
+            "multimodal_tokens": tokens_up_to_idx,
+            "is_multimodal": True,
+            "_base_dir": base_dir,
+            "qid": question_id,
+        }
+        
+        logger.info(f"[Multimodal Debug] Question run at index {run_idx}: text_length={len(question_run['text'])}, images={len(images)}, image_paths={images}")
+        question_runs.append(question_run)
+    
     return question_runs
 
 
@@ -71,11 +178,88 @@ def run_and_eval_tossup_dataset(
     return tossup_outputs
 
 
+def _get_bonus_leadin_and_part_for_part(example: dict, part_index: int) -> tuple[str | dict, str | dict]:
+    """
+    Get leadin and part inputs for one bonus part, supporting text-only and multimodal.
+    Returns (leadin_input, part_input) where each is either a string (text) or a dict with
+    text, images, is_multimodal, and optionally multimodal_tokens, _base_dir, qid.
+    """
+    qid = example.get("qid", "")
+    base_dir = example.get("_base_dir", "")
+    leadin_tokens = example.get("leadin_multimodal_tokens") or []
+    parts = example["parts"]
+    part = parts[part_index]
+    part_tokens = part.get("multimodal_tokens") or []
+
+    # Embedded images (Hub dataset): leadin_images, part_images, part_image_splits
+    leadin_images = example.get("leadin_images")
+    part_images_flat = example.get("part_images")
+    part_image_splits = example.get("part_image_splits") or [0] * (len(parts) + 1)
+    if not part_image_splits and part_images_flat is not None:
+        part_image_splits = [0, len(part_images_flat)]
+
+    is_leadin_multimodal = len(leadin_tokens) > 0
+    is_part_multimodal = len(part_tokens) > 0
+    is_multimodal = is_leadin_multimodal or is_part_multimodal
+
+    if not is_multimodal:
+        return example["leadin"], part["question"]
+
+    # Build leadin input (text + images)
+    leadin_text = get_text_with_placeholders(leadin_tokens) if leadin_tokens else example["leadin"]
+    leadin_images_list = []
+    if leadin_images is not None:
+        leadin_images_list = list(leadin_images)
+    else:
+        for token in leadin_tokens:
+            if token.get("type") == "image":
+                resolved = resolve_image_path_from_token(token, base_dir, qid)
+                if resolved:
+                    leadin_images_list.append(resolved)
+                elif token.get("path"):
+                    leadin_images_list.append(token["path"])
+
+    # Build part input (text + images)
+    part_text = get_text_with_placeholders(part_tokens) if part_tokens else part["question"]
+    part_images_list = []
+    if part_images_flat is not None and part_image_splits:
+        start = part_image_splits[part_index]
+        end = part_image_splits[part_index + 1]
+        part_images_list = list(part_images_flat[start:end])
+    else:
+        for token in part_tokens:
+            if token.get("type") == "image":
+                resolved = resolve_image_path_from_token(token, base_dir, qid)
+                if resolved:
+                    part_images_list.append(resolved)
+                elif token.get("path"):
+                    part_images_list.append(token["path"])
+
+    leadin_input = {
+        "text": leadin_text,
+        "images": leadin_images_list,
+        "is_multimodal": is_leadin_multimodal,
+        "multimodal_tokens": leadin_tokens if is_leadin_multimodal else None,
+        "_base_dir": base_dir,
+        "qid": qid,
+    }
+    part_input = {
+        "text": part_text,
+        "images": part_images_list,
+        "is_multimodal": is_part_multimodal,
+        "multimodal_tokens": part_tokens if is_part_multimodal else None,
+        "_base_dir": base_dir,
+        "qid": qid,
+    }
+    return leadin_input, part_input
+
+
 def run_and_evaluate_bonus(agent: QuizBowlBonusAgent, example: dict, return_extras: bool = False) -> dict:
     results = []
     for i, part in enumerate(example["parts"], start=1):
+        leadin_input, part_input = _get_bonus_leadin_and_part_for_part(example, i - 1)
         try:
-            result = agent.run(example["leadin"], part["question"])
+            result = agent.run(leadin_input, part_input)
             if return_extras:
                 result = result
             else:
