@@ -205,41 +205,28 @@ def execute_model_step(
     # Ensure inputs are processed using the specified functions in input_fields.
     processed_inputs = create_processed_inputs(model_step, available_vars)
 
-    # Extract images if present (check available_vars first, then processed_inputs)
+    # Extract images only when the step explicitly declares an image input variable.
     images = None
-    
-    # Check available_vars directly (images may not be in input_fields)
-    if "images" in available_vars:
-        images = available_vars["images"]
-        if not isinstance(images, list):
-            images = [images] if images else None
-        elif len(images) == 0:
-            images = None
-        if images:
-            logger.info(f"[Multimodal Debug] Step {model_step.id}: Found {len(images)} images in available_vars: {images}")
-    
-    # Also check processed_inputs (in case images is an input field)
-    if images is None and "images" in processed_inputs:
-        images = processed_inputs.pop("images")
-        if not isinstance(images, list):
-            images = [images] if images else None
-        elif len(images) == 0:
-            images = None
-        if images:
-            logger.info(f"[Multimodal Debug] Step {model_step.id}: Found {len(images)} images in processed_inputs: {images}")
-    
-    # Check for images in multimodal_tokens if present
-    if images is None:
-        multimodal_tokens = available_vars.get("multimodal_tokens") or processed_inputs.get("multimodal_tokens")
-        if isinstance(multimodal_tokens, list):
-            image_paths = [
-                token.get("path") 
-                for token in multimodal_tokens 
-                if isinstance(token, dict) and token.get("type") == "image" and token.get("path")
-            ]
-            if image_paths:
-                images = image_paths
-                logger.info(f"[Multimodal Debug] Step {model_step.id}: Extracted {len(image_paths)} images from multimodal_tokens: {image_paths}")
+    image_field_names = [
+        field.name
+        for field in model_step.input_fields
+        if field.variable in {"question_images", "leadin_images", "part_images", "images"}
+    ]
+    if image_field_names:
+        collected_images: list[Any] = []
+        for image_field_name in image_field_names:
+            if image_field_name not in processed_inputs:
+                continue
+            value = processed_inputs.pop(image_field_name)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                collected_images.extend(value)
+            else:
+                collected_images.append(value)
+        if collected_images:
+            images = collected_images
+            logger.info(f"[Multimodal Debug] Step {model_step.id}: Found {len(images)} images via input variable(s)")
     
     if images is None:
         logger.info(f"[Multimodal Debug] Step {model_step.id}: No images found - text-only input")

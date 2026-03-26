@@ -17,7 +17,7 @@ Given a question clue, output your most likely guess in a couple words with a ca
 
 def create_empty_bonus_workflow():
     return Workflow(
-        inputs=["leadin", "part"],
+        inputs=["leadin", "part", "leadin_images", "part_images"],
         outputs={"answer": None, "confidence": None, "explanation": None},
         steps={},
     )
@@ -25,7 +25,7 @@ def create_empty_bonus_workflow():
 
 def create_empty_tossup_workflow():
     return TossupWorkflow(
-        inputs=["question_text"],
+        inputs=["question_text", "question_images"],
         outputs={"answer": None, "confidence": None},
         steps={},
     )
@@ -35,7 +35,7 @@ def create_first_step_input_fields() -> list[InputField]:
     return [
         InputField(
             name="question",
-            description="The question text progressively revealed so far. For multimodal questions, images are attached automatically by the app (no separate input).",
+            description="The question text progressively revealed so far.",
             variable="question_text",
         )
     ]
@@ -94,7 +94,7 @@ def create_first_llm_step() -> ModelStep:
 
 def create_simple_qb_tossup_workflow():
     return TossupWorkflow(
-        inputs=["question_text"],
+        inputs=["question_text", "question_images"],
         outputs={"answer": "A.answer", "confidence": "A.confidence"},
         steps={
             "A": ModelStep(
@@ -153,7 +153,7 @@ EXPLANATION: <your reasoning>"""
 def create_simple_qb_bonus_workflow() -> Workflow:
     """Create a simple model step for bonus questions."""
     return Workflow(
-        inputs=["leadin", "part"],
+        inputs=["leadin", "part", "leadin_images", "part_images"],
         outputs={"answer": "A.answer", "confidence": "A.confidence", "explanation": "A.explanation"},
         steps={
             "A": ModelStep(

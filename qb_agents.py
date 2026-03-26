@@ -108,7 +108,17 @@ class QuizBowlTossupAgent:
             question_input = question_run
         
         # Build workflow input with text (required)
-        workflow_input = {self.external_input_variable: question_input["text"]}
+        workflow_input = {
+            self.external_input_variable: question_input["text"],
+            # Keep this optional in practice: default to empty so workflows that
+            # declare question_images do not fail on text-only runs.
+            "question_images": [],
+        }
+        should_send_images = any(
+            field.variable == "question_images"
+            for step in self.workflow.steps.values()
+            for field in step.input_fields
+        )
         
         # Add multimodal data if present
         is_multimodal = question_input.get("is_multimodal", False)
@@ -118,7 +128,7 @@ class QuizBowlTossupAgent:
         logger.info(f"[Multimodal Debug] Run {run_idx}: is_multimodal={is_multimodal}, images={images}, has_multimodal_tokens={'multimodal_tokens' in question_input}")
         
         # Resolve image paths if they're relative
-        if is_multimodal:
+        if is_multimodal and should_send_images:
             # Try to extract images from multimodal_tokens if images list is empty
             if not images and "multimodal_tokens" in question_input and question_input["multimodal_tokens"]:
                 try:
@@ -174,16 +184,18 @@ class QuizBowlTossupAgent:
                             logger.warning(f"[Multimodal Debug] Could not resolve image path: {img_path}, using as-is")
                 
                 if resolved_images:
-                    workflow_input["images"] = resolved_images
-                    logger.info(f"[Multimodal Debug] Added {len(resolved_images)} images to workflow_input: {resolved_images}")
-                    # Also include multimodal_tokens if available for context
-                    if "multimodal_tokens" in question_input:
-                        workflow_input["multimodal_tokens"] = question_input["multimodal_tokens"]
-                        logger.info(f"[Multimodal Debug] Added multimodal_tokens with {len(question_input['multimodal_tokens'])} tokens")
+                    workflow_input["question_images"] = resolved_images
+                    logger.info(
+                        f"[Multimodal Debug] Added {len(resolved_images)} images to workflow_input.question_images"
+                    )
                 else:
                     logger.warning(f"[Multimodal Debug] No valid image paths after resolution")
             elif is_multimodal:
                 logger.warning(f"[Multimodal Debug] is_multimodal=True but no images found")
+        elif is_multimodal and not should_send_images:
+            logger.info(
+                "[Multimodal Debug] question_images is not used by any step; running text-only for this run"
+            )
         else:
             logger.info(f"[Multimodal Debug] Not multimodal or no images - text-only question")
         
@@ -289,7 +301,14 @@ class QuizBowlBonusAgent:
         leadin_text = leadin if isinstance(leadin, str) else leadin.get("text", "")
         part_text = part if isinstance(part, str) else part.get("text", "")
 
-        workflow_input = {"leadin": leadin_text, "part": part_text}
+        workflow_input = {
+            "leadin": leadin_text,
+            "part": part_text,
+            # Optional image channels: defaults avoid missing-input errors
+            # when workflows include these vars but a run has no images.
+            "leadin_images": [],
+            "part_images": [],
+        }
 
         # Multimodal: combine leadin images + part images (order matches prompt)
         leadin_images = [] if isinstance(leadin, str) else leadin.get("images") or []
@@ -325,12 +344,13 @@ class QuizBowlBonusAgent:
                     elif token.get("path"):
                         part_images.append(token["path"])
 
-        combined_images = list(leadin_images) + list(part_images)
-        if combined_images:
-            # Resolve paths for relative/local images (same as tossup agent)
+        # Resolve paths for relative/local images (same as tossup agent),
+        # but keep leadin/part image channels separate.
+        def _resolve_images(images: list):
             import os
+
             resolved_images = []
-            for img in combined_images:
+            for img in images:
                 if not isinstance(img, str):
                     resolved_images.append(img)
                     continue
@@ -353,7 +373,10 @@ class QuizBowlBonusAgent:
                             break
                     if not found:
                         resolved_images.append(img_path)
-            workflow_input["images"] = resolved_images
+            return resolved_images
+
+        workflow_input["leadin_images"] = _resolve_images(list(leadin_images))
+        workflow_input["part_images"] = _resolve_images(list(part_images))
 
         workflow_output, response_time = _get_workflow_response(
             self.workflow,

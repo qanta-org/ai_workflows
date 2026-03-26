@@ -383,39 +383,44 @@ class WorkflowValidator:
         for field in step.input_fields:
             if not self._validate_input_field(field, allow_empty):
                 return False
-            if field.name in input_names:
+            if field.name and field.name in input_names:
                 self.errors.append(
                     ValidationError(
                         ValidationErrorType.STEP, f"Duplicate input field name: {field.name}", step.id, field.name
                     )
                 )
                 return False
-            input_names.add(field.name)
+            if field.name:
+                input_names.add(field.name)
 
         # Validate output fields
         output_names = set()
         for field in step.output_fields:
             if not self._validate_output_field(field, allow_empty):
                 return False
-            if field.name in output_names:
+            if field.name and field.name in output_names:
                 self.errors.append(
                     ValidationError(
                         ValidationErrorType.STEP, f"Duplicate output field name: {field.name}", step.id, field.name
                     )
                 )
                 return False
-            output_names.add(field.name)
+            if field.name:
+                output_names.add(field.name)
 
         return True
 
     def _validate_input_field(self, field: InputField, allow_empty: bool = False) -> bool:
         """Validates an input field"""
-        # Validate required fields
-        if not field.name or not field.description or not field.variable:
+        # Validate required fields (skip when allow_empty for intermediate editing state)
+        if not allow_empty and (not field.name or not field.description or not field.variable):
             self.errors.append(
                 ValidationError(ValidationErrorType.STEP, "Input field missing required fields", field_name=field.name)
             )
             return False
+        if allow_empty and not field.name and not field.description and not (field.variable or "").strip():
+            # Fully empty row is ok when editing
+            return True
 
         # Validate field name
         if not self._is_valid_identifier(field.name, allow_empty):
@@ -465,12 +470,15 @@ class WorkflowValidator:
 
     def _validate_output_field(self, field: OutputField, allow_empty: bool = False) -> bool:
         """Validates an output field"""
-        # Validate required fields
-        if not field.name or not field.description:
+        # Validate required fields (skip when allow_empty for intermediate editing state)
+        if not allow_empty and (not field.name or not field.description):
             self.errors.append(
                 ValidationError(ValidationErrorType.STEP, "Output field missing required fields", field_name=field.name)
             )
             return False
+        if allow_empty and not field.name and not field.description:
+            # Fully empty row is ok when editing
+            return True
 
         # Validate field name
         if not self._is_valid_identifier(field.name, allow_empty):
