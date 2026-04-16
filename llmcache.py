@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 import time
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -557,7 +558,8 @@ class LLMCache:
         dataset = Dataset.from_list(entries)
         repo_id, config_name, split = parse_dataset_repo_id(self.hf_repo)
         config_name = config_name or "default"
-        dataset.push_to_hub(repo_id, config_name=config_name, split=split, private=True)
+        token = os.environ.get("HF_TOKEN_WRITE") or os.environ.get("HF_TOKEN_READ") or os.environ.get("HF_TOKEN")
+        dataset.push_to_hub(repo_id, config_name=config_name, split=split, private=True, token=token)
         logger.info(f"Finished syncing {len(cache)} cached items to HF dataset {repo_id}")
 
     def clear(self) -> None:
