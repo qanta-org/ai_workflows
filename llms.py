@@ -53,6 +53,40 @@ MIME_BY_EXT = {
     ".webp": "image/webp",
 }
 
+_DEFAULT_OPENAI_BASE_URL = "https://us.api.openai.com/v1"
+
+
+def _resolve_openai_base_url() -> str:
+    """Base URL for OpenAI SDK / LangChain (must end with /v1).
+
+    Regional API keys return 401 ``incorrect_hostname`` when called via the global
+    ``https://api.openai.com/v1``. Hugging Face and other templates often set that host
+    explicitly; rewrite only the global hostname so US-pinned projects work.
+    """
+    from urllib.parse import urlparse
+
+    raw = (os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or "").strip().strip('"').strip("'")
+    if not raw:
+        return _DEFAULT_OPENAI_BASE_URL
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        logger.warning(f"Invalid OPENAI_BASE_URL {raw!r}; using {_DEFAULT_OPENAI_BASE_URL}")
+        return _DEFAULT_OPENAI_BASE_URL
+    host = (parsed.hostname or "").lower()
+    if host == "api.openai.com":
+        logger.info(
+            "OPENAI_BASE_URL uses global api.openai.com; using {}. "
+            "Set OPENAI_BASE_URL=https://eu.api.openai.com/v1 (or your region) if not US.",
+            _DEFAULT_OPENAI_BASE_URL,
+        )
+        return _DEFAULT_OPENAI_BASE_URL
+    base = raw.rstrip("/")
+    if not base.lower().endswith("/v1"):
+        base = f"{base}/v1"
+    return base
+
 
 def _image_to_base64_data(image_spec: Any) -> Tuple[Optional[str], str]:
     """
@@ -181,12 +215,11 @@ def _langchain_completion(
     from pathlib import Path
     
     if provider == "OpenAI":
-        # Use US endpoint by default to avoid 401 incorrect regional hostname
-        openai_base = os.getenv("OPENAI_BASE_URL", "https://us.api.openai.com/v1")
+        openai_base = _resolve_openai_base_url()
         llm = ChatOpenAI(
             model=model,
             temperature=temperature,
-            openai_api_base=openai_base or "https://us.api.openai.com/v1",
+            openai_api_base=openai_base,
         ).with_structured_output(response_model, include_raw=True)
     elif provider == "Anthropic":
         model_cls = ChatAnthropic
@@ -287,11 +320,10 @@ def _openai_completion(
         {"role": "system", "content": system},
         {"role": "user", "content": user_content if images else prompt},
     ]
-    # Use US endpoint by default to avoid 401 incorrect regional hostname; override with OPENAI_BASE_URL if set
-    base_url = os.getenv("OPENAI_BASE_URL", "https://us.api.openai.com/v1")
+    base_url = _resolve_openai_base_url()
     client = OpenAI(
         api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=base_url or "https://us.api.openai.com/v1",
+        base_url=base_url,
     )
     response = client.beta.chat.completions.parse(
         model=model,
