@@ -332,9 +332,36 @@ def _openai_completion(
         logprobs=logprobs,
         temperature=temperature,
     )
+    msg = response.choices[0].message
     output = {}
-    output["content"] = response.choices[0].message.content
-    output["output"] = response.choices[0].message.parsed.model_dump()
+    output["content"] = msg.content
+    if msg.parsed is not None:
+        output["output"] = msg.parsed.model_dump()
+    else:
+        refusal = getattr(msg, "refusal", None)
+        raw = msg.content
+        if refusal:
+            raise ValueError(f"OpenAI refused structured output (model={model}): {refusal}")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            raise ValueError(
+                f"OpenAI returned no parsed object and empty content (model={model}); "
+                f"finish_reason={getattr(response.choices[0], 'finish_reason', None)!r}"
+            )
+        logger.warning(
+            "OpenAI message.parsed is None; validating content as JSON for {} (finish_reason={})",
+            model,
+            getattr(response.choices[0], "finish_reason", None),
+        )
+        text = raw if isinstance(raw, str) else str(raw)
+        try:
+            repaired_obj = json_repair.loads(text, skip_json_loads=True)
+            parsed = response_model.model_validate(repaired_obj)
+            output["output"] = parsed.model_dump()
+        except Exception as e:
+            logger.error("Failed to recover structured output from OpenAI content (first 500 chars): {}", repr(text[:500]))
+            raise ValueError(
+                f"Could not parse OpenAI response into {getattr(response_model, '__name__', str(response_model))!r}: {e}"
+            ) from e
     if logprobs:
         output["logprob"] = sum(lp.logprob for lp in response.choices[0].logprobs.content)
         output["prob"] = np.exp(output["logprob"])
