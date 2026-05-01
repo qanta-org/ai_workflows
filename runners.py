@@ -133,18 +133,31 @@ def run_and_evaluate_tossup(
     question_runs = get_question_runs(example)
     try:
         run_outputs = agent.run(question_runs, early_stop=early_stop)
+        for run_output in run_outputs:
+            if return_extras:
+                run_out = run_output
+            else:
+                run_out = {k: run_output[k] for k in ["guess", "confidence", "buzz", "run_idx"]}
+            run_out["correct"] = evaluate_prediction(run_out["guess"], example["clean_answers"])
+            # This is 1-indexed token-position
+            run_out["token_position"] = example["run_indices"][run_output["run_idx"] - 1] + 1
+            results.append(run_out)
     except Exception as e:
-        logger.error(f"Error running {example['qid']}: {e}")
-        run_outputs = []
-    for run_output in run_outputs:
-        if return_extras:
-            run_out = run_output
-        else:
-            run_out = {k: run_output[k] for k in ["guess", "confidence", "buzz", "run_idx"]}
-        run_out["correct"] = evaluate_prediction(run_out["guess"], example["clean_answers"])
-        # This is 1-indexed token-position
-        run_out["token_position"] = example["run_indices"][run_output["run_idx"] - 1] + 1
-        results.append(run_out)
+        preview = example.get("question") or ""
+        if question_runs:
+            first = question_runs[0]
+            if isinstance(first, dict):
+                preview = first.get("text") or preview
+            else:
+                preview = str(first)
+        logger.error(
+            "Tossup run failed qid={} (run_indices={}): {}",
+            example.get("qid"),
+            example.get("run_indices"),
+            e,
+        )
+        logger.error("Question text preview (first run): {}", preview[:1200] if preview else "(empty)")
+        raise
     return {
         "qid": example["qid"],
         "run_outputs": results,
