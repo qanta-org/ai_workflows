@@ -40,16 +40,12 @@ AVAILABLE_MODELS = {
         "model": "gpt-3.5-turbo-0125",
         "cost_per_million": 0.15,
     },
-    "Anthropic/claude-3-7-sonnet": {
-        "model": "claude-3-7-sonnet-20250219",
+    "Anthropic/claude-sonnet-4-6": {
+        "model": "claude-sonnet-4-6",
         "cost_per_million": 3.0,
     },
-    "Anthropic/claude-3-5-sonnet": {
-        "model": "claude-3-5-sonnet-20241022",
-        "cost_per_million": 3.0,
-    },
-    "Anthropic/claude-3-5-haiku": {
-        "model": "claude-3-5-haiku-20241022",
+    "Anthropic/claude-haiku-4-5": {
+        "model": "claude-haiku-4-5-20251001",
         "cost_per_million": 0.80,
     },
     "Cohere/command-a": {

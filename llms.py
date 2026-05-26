@@ -557,7 +557,7 @@ if __name__ == "__main__":
         answer: str = Field(description="The short answer to the question")
         explanation: str = Field(description="5 words terse best explanation of the answer.")
 
-    TEST_MODELS = ["Cohere/command-r7b", "Anthropic/claude-3-5-haiku", "DeepSeek/V3"]
+    TEST_MODELS = ["Cohere/command-r7b", "Anthropic/claude-haiku-4-5", "DeepSeek/V3"]
 
     models = TEST_MODELS
     system = "You are an accurate and concise explainer of scientific concepts."

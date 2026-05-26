@@ -24,7 +24,11 @@ def _get_workflow_response(
         return workflow_output, response_time
     except APIStatusError as e:
         logger.error(f"Anthropic API error {e.status_code}: {e}")
-        raise ProviderAPIError(workflow, "Anthropic", "Quota exceeded")
+        if e.status_code == 429:
+            raise ProviderAPIError(workflow, "Anthropic", "Quota / Rate limit exceeded")
+        if e.status_code == 404:
+            raise ProviderAPIError(workflow, "Anthropic", f"Model not found: {e.message}")
+        raise ProviderAPIError(workflow, "Anthropic", e.message)
     except APIError as e:
         logger.error(f"OpenAI API error {e.status_code}: {e}")
         if e.code == 429:
