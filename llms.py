@@ -140,8 +140,39 @@ class CohereSchemaGenerator(GenerateJsonSchema):
         return return_value
 
 
+def _model_supports_vision(model: str) -> bool:
+    """Whether the model can accept image inputs in chat completions."""
+    return AVAILABLE_MODELS.get(model, {}).get("supports_vision", False)
+
+
+def _strip_images_for_text_only_model(model: str, prompt: str, images: list | None) -> tuple[list | None, str]:
+    """Drop images for text-only models; adjust prompt so image placeholders remain usable."""
+    if not images:
+        return images, prompt
+    if _model_supports_vision(model):
+        return images, prompt
+    logger.warning(
+        f"{model} does not support vision; ignoring {len(images)} image(s). "
+        "Text placeholders like <img:...> are still included in the prompt."
+    )
+    note = (
+        f"\n\nNote: This question references {len(images)} image(s) "
+        "(marked with <img:...> placeholders in the text), but you cannot see them. "
+        "Answer using only the visible text."
+    )
+    if "image(s) are included with this question" in prompt:
+        prompt = prompt.replace(
+            f"\n\nNote: {len(images)} image(s) are included with this question. "
+            "Please analyze the image(s) along with the text to answer the question.",
+            note,
+        )
+    elif note.strip() not in prompt:
+        prompt = prompt + note
+    return None, prompt
+
+
 def _openai_is_json_mode_supported(model_name: str) -> bool:
-    if model_name.startswith("gpt-4"):
+    if model_name.startswith("gpt-4") or model_name.startswith("gpt-5"):
         return True
     if model_name.startswith("gpt-3.5"):
         return False
@@ -464,9 +495,8 @@ def _llm_completion(
     """
     model_name = AVAILABLE_MODELS[model]["model"]
     provider = model.split("/")[0]
+    images, prompt = _strip_images_for_text_only_model(model, prompt, images)
     if provider == "Cohere":
-        if images:
-            logger.warning(f"Cohere provider does not support images, ignoring {len(images)} images")
         return _cohere_completion(model_name, system, prompt, response_format, temperature, logprobs)
     elif provider == "OpenAI":
         if _openai_is_json_mode_supported(model_name):
